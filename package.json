@@ -1,0 +1,126 @@
+const express = require("express");
+const { customAlphabet } = require("nanoid");
+const Joi = require("joi");
+const geoip = require("geoip-lite");
+const morgan = require("morgan");
+const cors = require("cors");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+app.use(cors());
+app.use(morgan("dev"));
+
+/**
+ * In-memory storage
+ * Map<shortcode, { longUrl, createdAt, expiry, clicks: [{at, referrer, ip, country, city}] }>
+ */
+const urls = new Map();
+const nano = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 7);
+
+// Helpers
+function baseUrl(req) {
+  return `${req.protocol}://${req.get("host")}`;
+}
+function nowIso() {
+  return new Date().toISOString();
+}
+function isExpired(iso) {
+  return new Date(iso).getTime() < Date.now();
+}
+function clientIp(req) {
+  const xfwd = req.headers["x-forwarded-for"];
+  const ip = (Array.isArray(xfwd) ? xfwd[0] : (xfwd || "")).split(",")[0].trim() || req.socket.remoteAddress || "";
+  return ip.replace("::ffff:", "");
+}
+
+const shortenSchema = Joi.object({
+  url: Joi.string().uri({ scheme: [/https?/] }).required(),
+  expiryMinutes: Joi.number().integer().min(1).max(60 * 24 * 30).optional(), // up to 30 days
+  shortcode: Joi.string().alphanum().min(4).max(12).optional()
+});
+
+// POST /shorten -> create short URL
+app.post("/shorten", (req, res) => {
+  const { error, value } = shortenSchema.validate(req.body || {});
+  if (error) return res.status(400).json({ error: "BAD_REQUEST", message: error.message });
+
+  const { url, expiryMinutes = 30, shortcode } = value;
+  let code = shortcode || nano();
+
+  if (urls.has(code)) {
+    if (shortcode) {
+      return res.status(409).json({ error: "CONFLICT", message: "Shortcode already in use." });
+    }
+    // rare collision for generated code -> regenerate
+    do { code = nano(); } while (urls.has(code));
+  }
+
+  const createdAt = nowIso();
+  const expiry = new Date(Date.now() + expiryMinutes * 60 * 1000).toISOString();
+
+  urls.set(code, {
+    longUrl: url,
+    createdAt,
+    expiry,
+    clicks: []
+  });
+
+  return res.status(201).json({ shortLink: `${baseUrl(req)}/${code}`, expiry });
+});
+
+// GET /:code -> redirect + record click
+app.get("/:code", (req, res) => {
+  const code = req.params.code;
+  const entry = urls.get(code);
+  if (!entry) return res.status(404).json({ error: "NOT_FOUND", message: "Shortcode does not exist." });
+  if (isExpired(entry.expiry)) return res.status(410).json({ error: "GONE", message: "This short link has expired." });
+
+  const referrer = req.get("referer") || "direct";
+  const ip = clientIp(req);
+  const geo = ip ? geoip.lookup(ip) : null;
+
+  entry.clicks.push({
+    at: nowIso(),
+    referrer,
+    ip,
+    country: geo?.country || null,
+    city: geo?.city || null
+  });
+
+  return res.redirect(302, entry.longUrl);
+});
+
+// GET /shorturls/:code -> usage statistics
+app.get("/shorturls/:code", (req, res) => {
+  const code = req.params.code;
+  const entry = urls.get(code);
+  if (!entry) return res.status(404).json({ error: "NOT_FOUND", message: "Shortcode does not exist." });
+
+  res.json({
+    code,
+    shortLink: `${req.protocol}://${req.get("host")}/${code}`,
+    originalUrl: entry.longUrl,
+    createdAt: entry.createdAt,
+    expiry: entry.expiry,
+    expired: isExpired(entry.expiry),
+    totalClicks: entry.clicks.length,
+    clicks: entry.clicks.map(c => ({
+      timestamp: c.at,
+      referrer: c.referrer,
+      location: { country: c.country, city: c.city },
+      ip: c.ip
+    }))
+  });
+});
+
+// fallback + error handler
+app.use((req, res) => res.status(404).json({ error: "NOT_FOUND", message: "Route not found." }));
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: "INTERNAL_ERROR", message: "Something went wrong." });
+});
+
+app.listen(PORT, () => console.log(`URL Shortener running at http://localhost:${PORT}`));
+
